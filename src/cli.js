@@ -1,12 +1,20 @@
 #!/usr/bin/env node
 
 import { exec, execFile } from 'node:child_process'
-import { mkdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { lstat, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import readline from 'node:readline/promises'
 import process, { loadEnvFile } from 'node:process'
+
+const shellEnv = {
+  LLM_SERVER: process.env.LLM_SERVER,
+  OLLAMA_HOST: process.env.OLLAMA_HOST,
+  OLLAMA_MODEL: process.env.OLLAMA_MODEL,
+  OLLAMA_NUM_CTX: process.env.OLLAMA_NUM_CTX
+}
 
 try {
   loadEnvFile(fileURLToPath(new URL('../.env', import.meta.url)))
@@ -14,13 +22,62 @@ try {
   if (error.code !== 'ENOENT') throw error
 }
 
+async function readConfigFile (filename) {
+  let contents
+  try {
+    contents = await readFile(join(process.cwd(), filename), 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT') return {}
+    throw new Error(`Could not read ${filename}: ${error.message}`, { cause: error })
+  }
+
+  let config
+  try {
+    config = JSON.parse(contents)
+  } catch (error) {
+    throw new Error(`Invalid JSON in ${filename}: ${error.message}`, { cause: error })
+  }
+
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error(`${filename} must contain a JSON object.`)
+  }
+
+  const allowedKeys = ['server', 'model', 'numCtx', 'workspaceDir', 'permissionMode']
+  const unknownKeys = Object.keys(config).filter(key => !allowedKeys.includes(key))
+  if (unknownKeys.length > 0) {
+    throw new Error(`Unknown setting${unknownKeys.length > 1 ? 's' : ''} in ${filename}: ${unknownKeys.join(', ')}.`)
+  }
+
+  for (const key of ['server', 'model', 'workspaceDir']) {
+    if (config[key] !== undefined && (typeof config[key] !== 'string' || config[key].trim() === '')) {
+      throw new Error(`${filename}: "${key}" must be a non-empty string.`)
+    }
+  }
+  if (config.numCtx !== undefined && (!Number.isInteger(config.numCtx) || config.numCtx < 1)) {
+    throw new Error(`${filename}: "numCtx" must be a positive integer.`)
+  }
+  if (config.permissionMode !== undefined && !['ask', 'allow-all'].includes(config.permissionMode)) {
+    throw new Error(`${filename}: "permissionMode" must be "ask" or "allow-all".`)
+  }
+
+  return config
+}
+
+const config = {
+  ...await readConfigFile('bouwer.config.json'),
+  ...await readConfigFile('.bouwer.json')
+}
+
 const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
 let workingDirectory = process.cwd()
-const host = (process.env.LLM_SERVER || process.env.OLLAMA_HOST || 'http://127.0.0.1:11434').replace(/\/+$/, '')
+let planFile
+let permissionMode = config.permissionMode || 'ask'
+const workspaceDir = resolve(process.cwd(), config.workspaceDir || 'workspace')
+const host = (shellEnv.LLM_SERVER || shellEnv.OLLAMA_HOST || config.server || process.env.LLM_SERVER || process.env.OLLAMA_HOST || 'http://127.0.0.1:11434').replace(/\/+$/, '')
 const chatEndpoint = host.endsWith('/api') ? `${host}/chat` : `${host}/api/chat`
-const model = process.env.OLLAMA_MODEL || 'qwen2.5-coder:7b'
-const numCtx = positiveInteger(process.env.OLLAMA_NUM_CTX, 4096)
+const model = shellEnv.OLLAMA_MODEL || config.model || process.env.OLLAMA_MODEL || 'qwen2.5-coder:7b'
+const numCtx = positiveInteger(shellEnv.OLLAMA_NUM_CTX || config.numCtx || process.env.OLLAMA_NUM_CTX, 4096)
 const maxToolCalls = 8
 const maxOutput = 64 * 1024
 const historyLimit = numCtx * 2
@@ -36,14 +93,14 @@ Do not execute tools or write the solution. Keep the plan to at most 5 short ste
 const workerPrompt = `You are a practical coding assistant working in the current project directory.
 Follow the architect's plan and complete the user's request. Be concise and use tools only when needed.
 You may execute Node.js code or terminal commands using the available tools. Never claim a command ran unless its output confirms it.
-Terminal commands require user approval. Work in small, verifiable steps and report what changed.`
+Tool permissions follow the configured permission mode. Work in small, verifiable steps and report what changed.`
 
 const tools = [
   {
     type: 'function',
     function: {
       name: 'run_command',
-      description: 'Run a shell command in the current project directory. Requires user approval.',
+      description: 'Run a shell command in the current project directory.',
       parameters: {
         type: 'object',
         properties: {
@@ -58,7 +115,7 @@ const tools = [
     type: 'function',
     function: {
       name: 'run_node',
-      description: 'Execute JavaScript source with the current Node.js runtime. Requires user approval.',
+      description: 'Execute JavaScript source with the current Node.js runtime.',
       parameters: {
         type: 'object',
         properties: {
@@ -78,13 +135,30 @@ function positiveInteger (value, fallback) {
 
 function parseCliOptions (args) {
   let workspace
+  let plan
   let help = false
   let workspaceSet = false
+  let permissionModeSet = false
 
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]
     if (arg === '--help' || arg === '-h') {
       help = true
+    } else if (arg === '--permission-mode' || arg.startsWith('--permission-mode=')) {
+      if (permissionModeSet) throw new Error('Use --permission-mode only once.')
+      permissionModeSet = true
+      const value = arg === '--permission-mode' ? args[++index] : arg.slice('--permission-mode='.length)
+      if (!['ask', 'allow-all'].includes(value)) {
+        throw new Error('--permission-mode must be "ask" or "allow-all".')
+      }
+      permissionMode = value
+    } else if (arg === '--plan' || arg.startsWith('--plan=')) {
+      if (plan !== undefined) throw new Error('Use --plan only once.')
+      plan = arg === '--plan' ? null : arg.slice('--plan='.length)
+      if (arg === '--plan' && args[index + 1] && !args[index + 1].startsWith('-')) {
+        plan = args[++index]
+      }
+      if (plan === '') throw new Error('--plan requires a non-empty filename.')
     } else if (arg === '--workspace') {
       if (workspaceSet) throw new Error('Use --workspace only once.')
       workspaceSet = true
@@ -102,28 +176,67 @@ function parseCliOptions (args) {
     }
   }
 
-  return { help, workspace: workspaceSet ? (workspace || null) : undefined }
+  return { help, plan, permissionMode, workspace: workspaceSet ? (workspace || null) : undefined }
+}
+
+async function readPlan (filename, optional = false) {
+  let contents
+  try {
+    contents = await readFile(filename, 'utf8')
+  } catch (error) {
+    if (optional && error.code === 'ENOENT') return null
+    throw new Error(`Could not read plan ${filename}: ${error.message}`, { cause: error })
+  }
+  if (!contents.trim()) throw new Error(`Plan is empty: ${filename}`)
+  if (contents.length > historyLimit) {
+    throw new Error(`Plan exceeds the low-context limit of ${historyLimit} characters: ${filename}`)
+  }
+  return contents
 }
 
 async function createWorkspace (name) {
-  const workspaceRoot = join(process.cwd(), 'workspace')
-  await mkdir(workspaceRoot, { recursive: true })
+  await mkdir(workspaceDir, { recursive: true })
 
   if (name !== null) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || name === '.' || name === '..') {
       throw new Error('Workspace name must be 1-64 letters, numbers, dots, underscores or hyphens, and start with a letter or number.')
     }
-    const directory = join(workspaceRoot, name)
-    await mkdir(directory)
-    return directory
+    const directory = join(workspaceDir, name)
+    try {
+      await mkdir(directory)
+      return { directory, created: true }
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+    }
+
+    const info = await lstat(directory)
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error(`Workspace path is not a regular directory: ${directory}`)
+    }
+
+    while (true) {
+      const answer = (await rl.question(
+        `\nWorkspace bestaat al: ${directory}\n[c] Doorgaan / [o] Opnieuw beginnen (met back-up) / [a] Annuleren [c]: `
+      )).trim().toLowerCase()
+      if (answer === '' || answer === 'c') return { directory, created: false }
+      if (answer === 'a') return null
+      if (answer === 'o') {
+        const backup = `${directory}.backup-${randomUUID()}`
+        await rename(directory, backup)
+        console.log(`Back-up opgeslagen: ${backup}`)
+        await mkdir(directory)
+        return { directory, created: true }
+      }
+      console.error('Kies c, o of a.')
+    }
   }
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
   for (let suffix = 0; ; suffix++) {
-    const directory = join(workspaceRoot, suffix ? `${timestamp}-${suffix}` : timestamp)
+    const directory = join(workspaceDir, suffix ? `${timestamp}-${suffix}` : timestamp)
     try {
       await mkdir(directory)
-      return directory
+      return { directory, created: true }
     } catch (error) {
       if (error.code !== 'EEXIST') throw error
     }
@@ -132,6 +245,12 @@ async function createWorkspace (name) {
 
 function shorten (text) {
   return text.length > maxOutput ? `${text.slice(0, maxOutput)}\n[output truncated]` : text
+}
+
+function color (text, code, stream = process.stdout) {
+  return stream.isTTY && process.env.NO_COLOR === undefined
+    ? `\x1b[${code}m${text}\x1b[0m`
+    : text
 }
 
 async function withStatus (label, operation) {
@@ -143,14 +262,14 @@ async function withStatus (label, operation) {
     const elapsed = Math.floor((Date.now() - started) / 1000)
     if (tty) {
       const frames = ['|', '/', '-', '\\']
-      process.stderr.write(`\r${frames[frame++ % frames.length]} ${label} (${elapsed}s)`)
+      process.stderr.write(`\r${color(`${frames[frame++ % frames.length]} ${label} (${elapsed}s)`, '36', process.stderr)}`)
     } else if (Date.now() - lastReported >= 5000) {
       process.stderr.write(`... ${label} (${elapsed}s)\n`)
       lastReported = Date.now()
     }
   }
 
-  process.stderr.write(`... ${label}\n`)
+  process.stderr.write(`${color(`⏳ ${label}`, '36', process.stderr)}\n`)
   const timer = setInterval(render, tty ? 100 : 1000)
   timer.unref()
 
@@ -159,20 +278,46 @@ async function withStatus (label, operation) {
     clearInterval(timer)
     const elapsed = ((Date.now() - started) / 1000).toFixed(1)
     if (tty) process.stderr.write(`\r\x1b[2K`)
-    process.stderr.write(`✓ ${label} (${elapsed}s)\n`)
+    process.stderr.write(`${color(`✅ ${label} (${elapsed}s)`, '32', process.stderr)}\n`)
     return result
   } catch (error) {
     clearInterval(timer)
     const elapsed = ((Date.now() - started) / 1000).toFixed(1)
     if (tty) process.stderr.write(`\r\x1b[2K`)
-    process.stderr.write(`✗ ${label} (${elapsed}s)\n`)
+    process.stderr.write(`${color(`❌ ${label} (${elapsed}s)`, '31', process.stderr)}\n`)
     throw error
   }
 }
 
-async function askApproval (command) {
-  const answer = await rl.question(`\nRun this command? [y/N]\n${command}\n> `)
-  return answer.trim().toLowerCase() === 'y'
+async function askApproval (name, value, timeout) {
+  const title = name === 'run_command' ? 'Terminalcommando' : 'Node.js-script'
+  const lines = value.split(/\r?\n/)
+  const width = String(lines.length).length
+  const separator = '─'.repeat(60)
+
+  console.log(`\n${color(`🔐 Toestemming nodig: ${title}`, '1;33')}`)
+  console.log(`📁 Werkmap: ${workingDirectory}`)
+  console.log(`⏱  Timeout: ${timeout / 1000}s`)
+  console.log(color('⚠️  Kan bestanden wijzigen of verwijderen en netwerkverzoeken uitvoeren.', '33'))
+  console.log(color(separator, '2'))
+  for (const [index, line] of lines.entries()) {
+    console.log(`${color(String(index + 1).padStart(width), '2')} │ ${line}`)
+  }
+  console.log(color(separator, '2'))
+  while (true) {
+    const answer = (await rl.question(
+      `${color('▶ Uitvoeren?', '1;33')} [y/ja = toestaan, n/nee/Enter = weigeren]: `
+    )).trim().toLowerCase()
+    if (['y', 'yes', 'j', 'ja'].includes(answer)) {
+      console.log(color('✅ Toegestaan.', '32'))
+      return true
+    }
+    if (['', 'n', 'no', 'nee'].includes(answer)) {
+      console.log(color('🚫 Geweigerd; niets uitgevoerd.', '33'))
+      return false
+    }
+    console.error('Kies y/ja om toe te staan of n/nee om te weigeren.')
+  }
 }
 
 async function runTool (name, args) {
@@ -186,7 +331,8 @@ async function runTool (name, args) {
   }
 
   const timeout = Math.min(positiveInteger(args.timeout_ms, 30000), 120000)
-  const approved = await askApproval(name === 'run_command' ? value : `node -e '<provided JavaScript>'`)
+  const approved = permissionMode === 'allow-all' ||
+    await askApproval(name, value, timeout)
   if (!approved) return 'Command not run: user declined approval.'
 
   return withStatus(name === 'run_command' ? 'Terminalcommando uitvoeren' : 'Node.js-script uitvoeren', async () => {
@@ -254,11 +400,30 @@ async function handleTurn (request) {
     ...(summary ? [{ role: 'user', content: `Project conversation summary:\n${summary}` }] : []),
     { role: 'user', content: request }
   ]
-  const plan = (await chat(architectMessages, false, 'Architect maakt plan')).content?.trim()
+  let plan = planFile ? await readPlan(planFile, true) : null
+  if (!plan) {
+    if (planFile) {
+      architectMessages[0] = {
+        role: 'system',
+        content: `${architectPrompt}\nReturn a Markdown plan with a short goal and at most 5 unchecked "- [ ]" tasks.`
+      }
+    }
+    plan = (await chat(architectMessages, false, 'Architect maakt plan')).content?.trim()
+    if (planFile && plan) {
+      if (plan.length > historyLimit) throw new Error('Generated plan exceeds the low-context limit.')
+      await writeFile(planFile, `${plan}\n`, { flag: 'wx' })
+      console.log(`Plan opgeslagen: ${planFile}`)
+    }
+  }
   if (!plan) throw new Error('The architect returned an empty plan.')
 
   const messages = [
-    { role: 'system', content: workerPrompt },
+    {
+      role: 'system',
+      content: planFile
+        ? `${workerPrompt}\nWorking directory: ${workingDirectory}\nPersistent plan: ${planFile}\nRead and follow this plan. Preserve its goals and existing completed tasks. Use the existing tools to mark tasks [x] only after completing and verifying them; leave blocked or unfinished tasks unchecked. These file edits also require approval. For follow-up requests, update the plan rather than replacing it.`
+        : workerPrompt
+    },
     ...(summary ? [{ role: 'system', content: `Conversation summary:\n${summary}` }] : []),
     ...history.slice(-6),
     { role: 'user', content: `Architect's plan:\n${plan}\n\nUser request:\n${request}` }
@@ -305,10 +470,12 @@ function printHelp () {
 Bouwer - a low-context coding assistant for Ollama
 
 Usage:
-  bouwer [--workspace [name]]
+  bouwer [--workspace [name]] [--plan [file]] [--permission-mode ask|allow-all]
 
 Options:
-  --workspace [name]  Create and use workspace/<name>; omit name to generate one
+  --workspace [name]  Create and use <workspaceDir>/<name>; omit name to generate one
+  --plan [file]       Execute an existing plan; omit file to use or create plan.md
+  --permission-mode   Set tool permissions to "ask" or "allow-all"
   -h, --help          Show this help
 
 Commands:
@@ -321,6 +488,11 @@ Environment:
   OLLAMA_HOST      Legacy alias for LLM_SERVER
   OLLAMA_MODEL     Model name (default: qwen2.5-coder:7b)
   OLLAMA_NUM_CTX   Context size (default: 4096)
+
+Config:
+  bouwer.config.json  Shared project settings
+  .bouwer.json        Personal settings (ignored by git)
+  permissionMode      "ask" (default) or "allow-all"
 `)
 }
 
@@ -330,16 +502,46 @@ async function main () {
     printHelp()
     return
   }
+  permissionMode = options.permissionMode
+
+  const sourcePlan = options.plan !== undefined ? resolve(options.plan || 'plan.md') : null
+  let existingPlan = sourcePlan ? await readPlan(sourcePlan, options.plan === null) : null
 
   if (options.workspace !== undefined) {
-    workingDirectory = await createWorkspace(options.workspace)
-    console.log(`Workspace aangemaakt: ${workingDirectory}`)
+    const workspace = await createWorkspace(options.workspace)
+    if (!workspace) {
+      console.log('Geannuleerd.')
+      return
+    }
+    workingDirectory = workspace.directory
+    console.log(`Workspace ${workspace.created ? 'aangemaakt' : 'hervat'}: ${workingDirectory}`)
+  }
+
+  if (sourcePlan) {
+    planFile = join(workingDirectory, basename(sourcePlan))
+    if (options.workspace === undefined) planFile = sourcePlan
+    if (planFile !== sourcePlan) {
+      const workspacePlan = await readPlan(planFile, true)
+      if (workspacePlan) {
+        existingPlan = workspacePlan
+      } else if (existingPlan) {
+        await writeFile(planFile, existingPlan, { flag: 'wx' })
+      }
+    }
+    console.log(`Plan: ${planFile}`)
   }
 
   console.log(`Bouwer | ${model} | context ${numCtx} | ${workingDirectory}`)
-  console.log('Type :help for commands. Tool execution asks for approval.')
+  console.log(`Tool permission mode: ${permissionMode}. Type :help for commands.`)
 
   try {
+    if (existingPlan) {
+      try {
+        await handleTurn('Execute the remaining work in the plan document. Preserve completed tasks and report unfinished work.')
+      } catch (error) {
+        console.error(`\nError: ${error.message}`)
+      }
+    }
     while (true) {
       const request = (await rl.question('\n> ')).trim()
       if (!request) continue
@@ -368,4 +570,11 @@ async function main () {
   }
 }
 
-await main()
+try {
+  await main()
+} catch (error) {
+  console.error(`\nError: ${error.message}`)
+  process.exitCode = 1
+} finally {
+  rl.close()
+}
