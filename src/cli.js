@@ -8,12 +8,27 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import readline from 'node:readline/promises'
 import process, { loadEnvFile } from 'node:process'
+import {
+  ARCHITECT_PROMPT,
+  CHAT_TIMEOUT_MS,
+  CONFIG_KEYS,
+  DEFAULT_MODEL,
+  DEFAULT_NUM_CTX,
+  DEFAULT_SERVER,
+  DEFAULT_TOOL_TIMEOUT_MS,
+  MAX_COMMAND_BUFFER,
+  MAX_OUTPUT,
+  MAX_TOOL_CALLS,
+  MAX_TOOL_TIMEOUT_MS,
+  PERMISSION_MODES,
+  TOOLS,
+  WORKER_PROMPT
+} from './constants.js'
 
 const shellEnv = {
   LLM_SERVER: process.env.LLM_SERVER,
-  OLLAMA_HOST: process.env.OLLAMA_HOST,
-  OLLAMA_MODEL: process.env.OLLAMA_MODEL,
-  OLLAMA_NUM_CTX: process.env.OLLAMA_NUM_CTX
+  LLM_MODEL: process.env.LLM_MODEL,
+  LLM_NUM_CTX: process.env.LLM_NUM_CTX
 }
 
 try {
@@ -42,8 +57,7 @@ async function readConfigFile (filename) {
     throw new Error(`${filename} must contain a JSON object.`)
   }
 
-  const allowedKeys = ['server', 'model', 'numCtx', 'workspaceDir', 'permissionMode']
-  const unknownKeys = Object.keys(config).filter(key => !allowedKeys.includes(key))
+  const unknownKeys = Object.keys(config).filter(key => !CONFIG_KEYS.includes(key))
   if (unknownKeys.length > 0) {
     throw new Error(`Unknown setting${unknownKeys.length > 1 ? 's' : ''} in ${filename}: ${unknownKeys.join(', ')}.`)
   }
@@ -56,7 +70,7 @@ async function readConfigFile (filename) {
   if (config.numCtx !== undefined && (!Number.isInteger(config.numCtx) || config.numCtx < 1)) {
     throw new Error(`${filename}: "numCtx" must be a positive integer.`)
   }
-  if (config.permissionMode !== undefined && !['ask', 'allow-all'].includes(config.permissionMode)) {
+  if (config.permissionMode !== undefined && !PERMISSION_MODES.includes(config.permissionMode)) {
     throw new Error(`${filename}: "permissionMode" must be "ask" or "allow-all".`)
   }
 
@@ -74,59 +88,15 @@ let workingDirectory = process.cwd()
 let planFile
 let permissionMode = config.permissionMode || 'ask'
 const workspaceDir = resolve(process.cwd(), config.workspaceDir || 'workspace')
-const host = (shellEnv.LLM_SERVER || shellEnv.OLLAMA_HOST || config.server || process.env.LLM_SERVER || process.env.OLLAMA_HOST || 'http://127.0.0.1:11434').replace(/\/+$/, '')
+const host = (shellEnv.LLM_SERVER || config.server || process.env.LLM_SERVER || DEFAULT_SERVER).replace(/\/+$/, '')
 const chatEndpoint = host.endsWith('/api') ? `${host}/chat` : `${host}/api/chat`
-const model = shellEnv.OLLAMA_MODEL || config.model || process.env.OLLAMA_MODEL || 'qwen2.5-coder:7b'
-const numCtx = positiveInteger(shellEnv.OLLAMA_NUM_CTX || config.numCtx || process.env.OLLAMA_NUM_CTX, 4096)
-const maxToolCalls = 8
-const maxOutput = 64 * 1024
+const model = shellEnv.LLM_MODEL || config.model || process.env.LLM_MODEL || DEFAULT_MODEL
+const numCtx = positiveInteger(shellEnv.LLM_NUM_CTX || config.numCtx || process.env.LLM_NUM_CTX, DEFAULT_NUM_CTX)
 const historyLimit = numCtx * 2
 const history = []
 let summary = ''
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-
-const architectPrompt = `You are the architect in a small coding assistant.
-Make a concise plan for the worker based on the user's request. Use the supplied project summary if present.
-Do not execute tools or write the solution. Keep the plan to at most 5 short steps.`
-
-const workerPrompt = `You are a practical coding assistant working in the current project directory.
-Follow the architect's plan and complete the user's request. Be concise and use tools only when needed.
-You may execute Node.js code or terminal commands using the available tools. Never claim a command ran unless its output confirms it.
-Tool permissions follow the configured permission mode. Work in small, verifiable steps and report what changed.`
-
-const tools = [
-  {
-    type: 'function',
-    function: {
-      name: 'run_command',
-      description: 'Run a shell command in the current project directory.',
-      parameters: {
-        type: 'object',
-        properties: {
-          command: { type: 'string', description: 'The shell command to run' },
-          timeout_ms: { type: 'integer', description: 'Timeout in milliseconds, maximum 120000' }
-        },
-        required: ['command']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'run_node',
-      description: 'Execute JavaScript source with the current Node.js runtime.',
-      parameters: {
-        type: 'object',
-        properties: {
-          code: { type: 'string', description: 'JavaScript source code to execute' },
-          timeout_ms: { type: 'integer', description: 'Timeout in milliseconds, maximum 120000' }
-        },
-        required: ['code']
-      }
-    }
-  }
-]
 
 function positiveInteger (value, fallback) {
   const parsed = Number.parseInt(value, 10)
@@ -148,7 +118,7 @@ function parseCliOptions (args) {
       if (permissionModeSet) throw new Error('Use --permission-mode only once.')
       permissionModeSet = true
       const value = arg === '--permission-mode' ? args[++index] : arg.slice('--permission-mode='.length)
-      if (!['ask', 'allow-all'].includes(value)) {
+      if (!PERMISSION_MODES.includes(value)) {
         throw new Error('--permission-mode must be "ask" or "allow-all".')
       }
       permissionMode = value
@@ -244,7 +214,7 @@ async function createWorkspace (name) {
 }
 
 function shorten (text) {
-  return text.length > maxOutput ? `${text.slice(0, maxOutput)}\n[output truncated]` : text
+  return text.length > MAX_OUTPUT ? `${text.slice(0, MAX_OUTPUT)}\n[output truncated]` : text
 }
 
 function color (text, code, stream = process.stdout) {
@@ -330,14 +300,14 @@ async function runTool (name, args) {
     return `Invalid ${name} input: expected a non-empty ${name === 'run_command' ? 'command' : 'code'} string.`
   }
 
-  const timeout = Math.min(positiveInteger(args.timeout_ms, 30000), 120000)
+  const timeout = Math.min(positiveInteger(args.timeout_ms, DEFAULT_TOOL_TIMEOUT_MS), MAX_TOOL_TIMEOUT_MS)
   const approved = permissionMode === 'allow-all' ||
     await askApproval(name, value, timeout)
   if (!approved) return 'Command not run: user declined approval.'
 
   return withStatus(name === 'run_command' ? 'Terminalcommando uitvoeren' : 'Node.js-script uitvoeren', async () => {
     try {
-      const options = { timeout, maxBuffer: 1024 * 1024, cwd: workingDirectory }
+      const options = { timeout, maxBuffer: MAX_COMMAND_BUFFER, cwd: workingDirectory }
       const result = name === 'run_command'
         ? await execAsync(value, options)
         : await execFileAsync(process.execPath, ['--input-type=module', '-e', value], options)
@@ -358,19 +328,19 @@ async function chat (messages, withTools = false, status = 'Model denkt na') {
         model,
         messages,
         stream: false,
-        ...(withTools ? { tools } : {}),
+        ...(withTools ? { tools: TOOLS } : {}),
         options: { num_ctx: numCtx, temperature: 0.2 }
       }),
-      signal: AbortSignal.timeout(180000)
+      signal: AbortSignal.timeout(CHAT_TIMEOUT_MS)
     })
 
     if (!response.ok) {
       const body = await response.text()
-      throw new Error(`Ollama returned ${response.status}: ${body}`)
+      throw new Error(`LLM server returned ${response.status}: ${body}`)
     }
 
     const data = await response.json()
-    if (!data.message) throw new Error('Ollama response did not contain a message.')
+    if (!data.message) throw new Error('LLM server response did not contain a message.')
     return data.message
   })
 }
@@ -396,7 +366,7 @@ async function handleTurn (request) {
   if (historySize > historyLimit) await summarizeHistory()
 
   const architectMessages = [
-    { role: 'system', content: architectPrompt },
+    { role: 'system', content: ARCHITECT_PROMPT },
     ...(summary ? [{ role: 'user', content: `Project conversation summary:\n${summary}` }] : []),
     { role: 'user', content: request }
   ]
@@ -405,7 +375,7 @@ async function handleTurn (request) {
     if (planFile) {
       architectMessages[0] = {
         role: 'system',
-        content: `${architectPrompt}\nReturn a Markdown plan with a short goal and at most 5 unchecked "- [ ]" tasks.`
+        content: `${ARCHITECT_PROMPT}\nReturn a Markdown plan with a short goal and at most 5 unchecked "- [ ]" tasks.`
       }
     }
     plan = (await chat(architectMessages, false, 'Architect maakt plan')).content?.trim()
@@ -421,15 +391,15 @@ async function handleTurn (request) {
     {
       role: 'system',
       content: planFile
-        ? `${workerPrompt}\nWorking directory: ${workingDirectory}\nPersistent plan: ${planFile}\nRead and follow this plan. Preserve its goals and existing completed tasks. Use the existing tools to mark tasks [x] only after completing and verifying them; leave blocked or unfinished tasks unchecked. These file edits also require approval. For follow-up requests, update the plan rather than replacing it.`
-        : workerPrompt
+        ? `${WORKER_PROMPT}\nWorking directory: ${workingDirectory}\nPersistent plan: ${planFile}\nRead and follow this plan. Preserve its goals and existing completed tasks. Use the existing tools to mark tasks [x] only after completing and verifying them; leave blocked or unfinished tasks unchecked. These file edits also require approval. For follow-up requests, update the plan rather than replacing it.`
+        : WORKER_PROMPT
     },
     ...(summary ? [{ role: 'system', content: `Conversation summary:\n${summary}` }] : []),
     ...history.slice(-6),
     { role: 'user', content: `Architect's plan:\n${plan}\n\nUser request:\n${request}` }
   ]
 
-  for (let call = 0; call < maxToolCalls; call++) {
+  for (let call = 0; call < MAX_TOOL_CALLS; call++) {
     const response = await chat(messages, true, `Worker werkt (stap ${call + 1})`)
     messages.push(response)
     const calls = response.tool_calls || []
@@ -462,12 +432,12 @@ async function handleTurn (request) {
     }
   }
 
-  throw new Error(`Stopped after ${maxToolCalls} tool rounds. Send a follow-up to continue.`)
+  throw new Error(`Stopped after ${MAX_TOOL_CALLS} tool rounds. Send a follow-up to continue.`)
 }
 
 function printHelp () {
   console.log(`
-Bouwer - a low-context coding assistant for Ollama
+Bouwer - a low-context coding assistant
 
 Usage:
   bouwer [--workspace [name]] [--plan [file]] [--permission-mode ask|allow-all]
@@ -484,10 +454,9 @@ Commands:
   :exit   Quit
 
 Environment:
-  LLM_SERVER       Ollama server URL (default: http://127.0.0.1:11434)
-  OLLAMA_HOST      Legacy alias for LLM_SERVER
-  OLLAMA_MODEL     Model name (default: qwen2.5-coder:7b)
-  OLLAMA_NUM_CTX   Context size (default: 4096)
+  LLM_SERVER      Server URL (default: http://127.0.0.1:11434)
+  LLM_MODEL       Model name (default: qwen2.5-coder:7b)
+  LLM_NUM_CTX     Context size (default: 4096)
 
 Config:
   bouwer.config.json  Shared project settings

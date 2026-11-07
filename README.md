@@ -1,14 +1,13 @@
 # Bouwer
 
-Een minimale coding-agent voor de Ollama `/api/chat`-endpoint. Bouwer gebruikt een architect voor een beknopt plan en een worker om dat plan uit te voeren. Alleen de worker krijgt tools voor Node.js-code en terminalcommando's; voor elk commando is goedkeuring nodig.
+Een minimale coding-agent voor een LLM-server met een compatibele `/api/chat`-endpoint. Bouwer gebruikt een architect voor een beknopt plan en een worker om dat plan uit te voeren. Alleen de worker krijgt tools voor Node.js-code en terminalcommando's; voor elk commando is goedkeuring nodig.
 
 ## Vereisten
 
 - Node.js 20 of hoger
-- Een draaiende Ollama-server en een model dat tool-calling ondersteunt
+- Een draaiende LLM-server met `/api/chat` en een model dat tool-calling ondersteunt
 
 ```sh
-ollama pull qwen2.5-coder:7b
 npm start
 ```
 
@@ -75,9 +74,9 @@ Bij goedkeuring toont Bouwer het type actie, de werkmap, timeout en volledige op
 Om een ander model of endpoint tijdelijk te gebruiken:
 
 ```sh
-OLLAMA_MODEL=llama3.1 LLM_SERVER=http://localhost:11434 npm start
+LLM_MODEL=llama3.1 LLM_SERVER=http://localhost:11434 npm start
 ```
 
 Omgevingsvariabelen uit `.env` blijven als fallback beschikbaar.
 
-`OLLAMA_NUM_CTX` bepaalt de contextgrootte en staat standaard op `4096`. Bouwer vat oudere conversatie samen wanneer de bewaarde chatgeschiedenis deze limiet nadert. Tijdens het werken toont Bouwer voortgang per architect-, worker-, samenvattings- en commandostap. `:clear` wist zowel de geschiedenis als de samenvatting; `:help` toont alle opdrachten.
+`LLM_NUM_CTX` bepaalt de contextgrootte en staat standaard op `4096`. Bouwer vat oudere conversatie samen wanneer de bewaarde chatgeschiedenis deze limiet nadert. Tijdens het werken toont Bouwer voortgang per architect-, worker-, samenvattings- en commandostap. `:clear` wist zowel de geschiedenis als de samenvatting; `:help` toont alle opdrachten.

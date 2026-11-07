@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A small, low-context coding agent for Ollama",
+  "description": "A small, low-context coding agent",
   "bin": {
     "bouwer": "./src/cli.js"
   },
